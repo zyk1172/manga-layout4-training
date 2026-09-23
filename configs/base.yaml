@@ -129,7 +129,7 @@ postprocess:
   balloon_mask_threshold: 0.50
 
 preflight:
-  real_model_batches: [4, 2, 1]
+  real_model_batches: [4, 3, 2, 1]
   max_reserved_vram_fraction: 0.80
   overfit_pages: 16
   overfit_steps: 500

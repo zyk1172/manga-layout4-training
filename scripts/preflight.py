@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse,json,sys,time,traceback
+import argparse,json,sys,time,traceback,statistics
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]; sys.path.insert(0,str(ROOT/'src'))
 from manga_layout4.config import load_config
@@ -27,21 +27,24 @@ def main():
    opt=torch.optim.AdamW(model.parameters(),lr=1e-4)
    # warm one step + timed two steps on actual graph
    timings=[]
-   for _ in range(3):
+   for _ in range(5):
     t0=time.perf_counter(); opt.zero_grad(set_to_none=True); loss=compute_loss(model(images),targets,cfg)['total']; loss.backward(); opt.step()
     if a.device.startswith('cuda'): torch.cuda.synchronize()
     timings.append(time.perf_counter()-t0)
    reserved=torch.cuda.max_memory_reserved() if a.device.startswith('cuda') else 0
    frac=reserved/max(total_mem,1)
-   row={'batch':bs,'status':'PASS','loss':float(loss.detach().cpu()),'seconds_per_step_median':sorted(timings[1:])[len(timings[1:])//2],'peak_reserved_gib':reserved/(1024**3),'vram_fraction':frac}
+   measured=timings[1:]
+   median=statistics.median(measured)
+   row={'batch':bs,'status':'PASS','loss':float(loss.detach().cpu()),'seconds_per_step_median':median,'seconds_per_step_samples':measured,'samples_per_second':bs/median,'peak_reserved_gib':reserved/(1024**3),'vram_fraction':frac}
    results.append(row)
-   if selected is None and (not a.device.startswith('cuda') or frac<=float(cfg['preflight']['max_reserved_vram_fraction'])): selected=bs
    del model,opt,images,targets
   except RuntimeError as e:
    results.append({'batch':bs,'status':'FAIL','error':str(e)[:500]})
    if a.device.startswith('cuda'): torch.cuda.empty_cache()
+ safe=[r for r in results if r['status']=='PASS' and (not a.device.startswith('cuda') or r['vram_fraction']<=float(cfg['preflight']['max_reserved_vram_fraction']))]
+ if safe: selected=int(max(safe,key=lambda r:r['samples_per_second'])['batch'])
  if selected is None: raise SystemExit('no safe batch size found')
  eff=int(cfg['training']['effective_batch_size']); accum=max(1,(eff+selected-1)//selected)
- report={'schema_version':'manga-layout4-preflight-v1','device':a.device,'gpu':torch.cuda.get_device_name(0) if a.device.startswith('cuda') else None,'torch':torch.__version__,'results':results,'recommended_micro_batch':selected,'recommended_gradient_accumulation':accum,'formal_gate':'PASS'}
+ report={'schema_version':'manga-layout4-preflight-v1','device':a.device,'gpu':torch.cuda.get_device_name(0) if a.device.startswith('cuda') else None,'torch':torch.__version__,'results':results,'batch_selection':'highest measured samples_per_second under the configured VRAM safety ceiling','recommended_micro_batch':selected,'recommended_gradient_accumulation':accum,'recommended_effective_batch_size':selected*accum,'formal_gate':'PASS'}
  out=ROOT/'outputs/preflight'; out.mkdir(parents=True,exist_ok=True); (out/'report.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report,indent=2))
 if __name__=='__main__': main()

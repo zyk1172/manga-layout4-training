@@ -1,6 +1,7 @@
 from __future__ import annotations
 from collections import defaultdict
 import math
+import numpy as np
 import torch
 from torch.nn import functional as F
 
@@ -73,13 +74,40 @@ def _boundary_similarity(pred:torch.Tensor,gt:torch.Tensor)->float:
     return inter/union
 
 
+def _packed_masks(masks: torch.Tensor, boundary: bool) -> np.ndarray:
+    """Pack binary masks to bytes, optionally expanding their boundary bands."""
+    masks=masks.detach().to(device='cpu',dtype=torch.bool)
+    count=int(masks.shape[0]); height=int(masks.shape[-2]); width=int(masks.shape[-1])
+    packed=[]
+    for start in range(0,count,32):
+        chunk=masks[start:start+32]
+        if boundary:
+            x=chunk.float()[:,None]
+            eroded=1-F.max_pool2d(1-x,3,1,1)
+            edge=((x-eroded)>0.5).float()
+            edge=F.max_pool2d(edge,5,1,2)
+            chunk=edge[:,0].bool()
+        packed.append(np.packbits(chunk.numpy().reshape(len(chunk),height*width),axis=1))
+    if not packed:
+        return np.empty((0,(height*width+7)//8),dtype=np.uint8)
+    return np.concatenate(packed,axis=0)
+
+
 def _pairwise_similarity(pred_masks: torch.Tensor, gt_masks: torch.Tensor, boundary: bool=False) -> list[list[float]]:
+    """Vectorized binary IoU for mask sets; byte packing avoids a huge P×G×H×W tensor."""
+    n_pred=int(pred_masks.shape[0]); n_gt=int(gt_masks.shape[0])
+    if n_pred==0: return []
+    if n_gt==0: return [[] for _ in range(n_pred)]
+    pred=_packed_masks(pred_masks,boundary); gt=_packed_masks(gt_masks,boundary)
+    popcount=np.asarray([i.bit_count() for i in range(256)],dtype=np.uint8)
+    pred_area=popcount[pred].sum(axis=1,dtype=np.uint32)
+    gt_area=popcount[gt].sum(axis=1,dtype=np.uint32)
     result=[]
-    for p in pred_masks:
-        row=[]
-        for g in gt_masks:
-            row.append(_boundary_similarity(p,g) if boundary else _mask_similarity(p,g))
-        result.append(row)
+    for start in range(0,n_pred,8):
+        common=np.bitwise_and(pred[start:start+8,None,:],gt[None,:,:])
+        intersection=popcount[common].sum(axis=2,dtype=np.uint32)
+        union=pred_area[start:start+8,None]+gt_area[None,:]-intersection
+        result.extend((intersection/np.maximum(union,1)).astype(np.float64).tolist())
     return result
 
 
