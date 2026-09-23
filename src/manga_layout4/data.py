@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import random
 from pathlib import Path
 from typing import Any
@@ -16,88 +17,86 @@ from .rle import decode_mask
 def _intersection_fraction(box: list[float], crop: tuple[int, int, int, int]) -> float:
     x1, y1, x2, y2 = box
     area = max(0.0, (x2 - x1) * (y2 - y1))
-    ix1 = max(x1, crop[0])
-    iy1 = max(y1, crop[1])
-    ix2 = min(x2, crop[2])
-    iy2 = min(y2, crop[3])
+    ix1 = max(x1, crop[0]); iy1 = max(y1, crop[1])
+    ix2 = min(x2, crop[2]); iy2 = min(y2, crop[3])
     inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
     return inter / max(area, 1e-6)
 
 
+def _transform_masks(
+    mask_by_index: dict[int, Image.Image],
+    crop: tuple[int, int, int, int] | None,
+) -> dict[int, Image.Image]:
+    if crop is None:
+        return mask_by_index
+    return {i: mask.crop(crop) for i, mask in mask_by_index.items()}
+
+
 def _letterbox_with_jitter(
     image: Image.Image,
-    balloon: Image.Image,
+    mask_by_index: dict[int, Image.Image],
     boxes: list[list[float]],
     size: int,
     scale_jitter: float,
     translate_fraction: float,
     train: bool,
-) -> tuple[Image.Image, Image.Image, list[list[float]], list[int]]:
-    """Resize to a square canvas with bounded translation and optional mild zoom.
+) -> tuple[Image.Image, list[list[float]], list[int], dict[int, Image.Image]]:
+    """Resize to square while preserving the complete page in V1.
 
-    `scale_jitter=1` is ordinary letterbox.  For training, jitter may zoom in/out,
-    but the center can move by at most `translate_fraction * size` from the
-    centered placement.  This deliberately avoids arbitrary object crops.
+    With the default config scale_jitter <= 1.0, the resized page always fits in
+    the canvas. Translation is clamped to the available padding and therefore
+    never turns a full object into a partial crop.
     """
     w, h = image.size
     base = min(size / w, size / h)
     scale = base * scale_jitter
-    nw = max(1, round(w * scale))
-    nh = max(1, round(h * scale))
+    nw = max(1, round(w * scale)); nh = max(1, round(h * scale))
     image = image.resize((nw, nh), Image.Resampling.BILINEAR)
-    balloon = balloon.resize((nw, nh), Image.Resampling.NEAREST)
+    resized_masks = {i: m.resize((nw, nh), Image.Resampling.NEAREST) for i, m in mask_by_index.items()}
 
-    center_x = (size - nw) // 2
-    center_y = (size - nh) // 2
+    center_x = (size - nw) // 2; center_y = (size - nh) // 2
     if train and translate_fraction > 0:
         max_shift = round(size * translate_fraction)
         ox = center_x + random.randint(-max_shift, max_shift)
         oy = center_y + random.randint(-max_shift, max_shift)
     else:
         ox, oy = center_x, center_y
+    if nw <= size:
+        ox = min(max(ox, 0), size - nw)
+    if nh <= size:
+        oy = min(max(oy, 0), size - nh)
 
     canvas = Image.new("RGB", (size, size), (255, 255, 255))
-    mask = Image.new("L", (size, size), 0)
     canvas.paste(image, (ox, oy))
-    mask.paste(balloon, (ox, oy))
+    transformed_masks: dict[int, Image.Image] = {}
+    for i, mask in resized_masks.items():
+        target = Image.new("L", (size, size), 0)
+        target.paste(mask, (ox, oy))
+        transformed_masks[i] = target
 
-    out: list[list[float]] = []
+    out_boxes: list[list[float]] = []
     kept: list[int] = []
-    for i, b in enumerate(boxes):
-        t = [
-            b[0] * scale + ox,
-            b[1] * scale + oy,
-            b[2] * scale + ox,
-            b[3] * scale + oy,
-        ]
-        old = max(1e-6, (t[2] - t[0]) * (t[3] - t[1]))
-        clipped = [
-            max(0.0, t[0]),
-            max(0.0, t[1]),
-            min(float(size), t[2]),
-            min(float(size), t[3]),
-        ]
-        new = max(0.0, (clipped[2] - clipped[0]) * (clipped[3] - clipped[1]))
-        if clipped[2] > clipped[0] and clipped[3] > clipped[1] and new / old >= 0.60:
-            out.append(clipped)
-            kept.append(i)
-    return canvas, mask, out, kept
+    out_masks: dict[int, Image.Image] = {}
+    for old_index, b in enumerate(boxes):
+        t = [b[0] * scale + ox, b[1] * scale + oy, b[2] * scale + ox, b[3] * scale + oy]
+        old_area = max(1e-6, (t[2] - t[0]) * (t[3] - t[1]))
+        clipped = [max(0.0, t[0]), max(0.0, t[1]), min(float(size), t[2]), min(float(size), t[3])]
+        new_area = max(0.0, (clipped[2] - clipped[0]) * (clipped[3] - clipped[1]))
+        if clipped[2] > clipped[0] and clipped[3] > clipped[1] and new_area / old_area >= 0.60:
+            new_index = len(out_boxes)
+            out_boxes.append(clipped); kept.append(old_index)
+            if old_index in transformed_masks:
+                out_masks[new_index] = transformed_masks[old_index]
+    return canvas, out_boxes, kept, out_masks
 
 
 class MangaLayoutDataset(Dataset):
-    def __init__(
-        self,
-        manifest: str | Path,
-        cfg: dict[str, Any],
-        split: str,
-        training: bool,
-        rows: list[dict[str, Any]] | None = None,
-    ):
-        self.cfg = cfg
-        self.split = split
-        self.training = training
+    def __init__(self, manifest: str | Path, cfg: dict[str, Any], split: str, training: bool,
+                 rows: list[dict[str, Any]] | None = None):
+        self.cfg = cfg; self.split = split; self.training = training
         self.rows = rows if rows is not None else list(iter_manifest(Path(manifest), split))
         self.size = int(cfg["input"]["image_size"])
+        self.mask_size = self.size // int(cfg["model"]["mask_output_stride"])
         self.stage1 = True
 
     def set_stage1(self, enabled: bool):
@@ -110,71 +109,50 @@ class MangaLayoutDataset(Dataset):
         row = self.rows[index]
         image = Image.open(row["image_path"]).convert("RGB")
         if image.size != (int(row["width"]), int(row["height"])):
-            raise RuntimeError(
-                f"image dimension mismatch {row['image_id']}: {image.size} vs {(row['width'], row['height'])}"
-            )
+            raise RuntimeError(f"image dimension mismatch {row['image_id']}: {image.size} vs {(row['width'], row['height'])}")
         anns = row["annotations"]
         boxes = [list(map(float, a["bbox_xyxy"])) for a in anns]
         labels = [CLASS_TO_ID[a["class_name"]] for a in anns]
-
-        # Only balloon RLE is retained in the compact manifest.  Other classes
-        # are box targets, so they never need to materialize a full mask here.
-        balloon_np = np.zeros((image.height, image.width), dtype=np.uint8)
-        for a in anns:
-            if a["class_name"] == "balloon":
-                segmentation = a.get("segmentation")
+        mask_by_index: dict[int, Image.Image] = {}
+        for i, ann in enumerate(anns):
+            if ann["class_name"] == "balloon":
+                segmentation = ann.get("segmentation")
                 if segmentation is None:
-                    raise RuntimeError(f"balloon mask missing for annotation {a.get('annotation_id')}")
-                balloon_np |= decode_mask(segmentation)
-        balloon = Image.fromarray(balloon_np * 255, mode="L")
+                    raise RuntimeError(f"balloon mask missing for annotation {ann.get('annotation_id')}")
+                mask_by_index[i] = Image.fromarray(decode_mask(segmentation) * 255, mode="L")
 
-        # A half-spread is the only content crop allowed in V1.  It is used only
-        # on sufficiently wide pages and requires >=60% of each retained box.
         s = self.cfg["sampling"]
-        if (
-            self.training
-            and image.width / image.height >= float(s["half_spread_min_aspect"])
-            and random.random() < float(s["half_spread_probability"])
-        ):
-            mid = image.width // 2
-            side = random.randint(0, 1)
+        if (self.training and float(s["half_spread_probability"]) > 0
+                and image.width / image.height >= float(s["half_spread_min_aspect"])
+                and random.random() < float(s["half_spread_probability"])):
+            mid = image.width // 2; side = random.randint(0, 1)
             crop = (0, 0, mid, image.height) if side == 0 else (mid, 0, image.width, image.height)
             keep = [i for i, b in enumerate(boxes) if _intersection_fraction(b, crop) >= 0.60]
-            new_boxes: list[list[float]] = []
-            new_labels: list[int] = []
+            new_boxes: list[list[float]] = []; new_labels: list[int] = []; new_masks: dict[int, Image.Image] = {}
+            cropped_masks = _transform_masks(mask_by_index, crop)
             for i in keep:
                 b = boxes[i]
-                clipped = [
-                    max(b[0], crop[0]) - crop[0],
-                    max(b[1], crop[1]) - crop[1],
-                    min(b[2], crop[2]) - crop[0],
-                    min(b[3], crop[3]) - crop[1],
-                ]
+                clipped = [max(b[0], crop[0]) - crop[0], max(b[1], crop[1]) - crop[1],
+                           min(b[2], crop[2]) - crop[0], min(b[3], crop[3]) - crop[1]]
                 if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
-                    new_boxes.append(clipped)
-                    new_labels.append(labels[i])
-            boxes, labels = new_boxes, new_labels
+                    new_index = len(new_boxes)
+                    new_boxes.append(clipped); new_labels.append(labels[i])
+                    if i in cropped_masks:
+                        new_masks[new_index] = cropped_masks[i]
+            boxes, labels, mask_by_index = new_boxes, new_labels, new_masks
             image = image.crop(crop)
-            balloon = balloon.crop(crop)
 
-        scale_jitter = 1.0
-        translate_fraction = 0.0
+        scale_jitter = 1.0; translate_fraction = 0.0
         if self.training and self.stage1:
             aug = self.cfg["augmentation"]
-            brightness = float(aug["brightness"])
-            contrast = float(aug["contrast"])
+            brightness = float(aug["brightness"]); contrast = float(aug["contrast"])
             image = ImageEnhance.Brightness(image).enhance(1.0 + random.uniform(-brightness, brightness))
             image = ImageEnhance.Contrast(image).enhance(1.0 + random.uniform(-contrast, contrast))
             scale_jitter = random.uniform(float(aug["scale_min"]), float(aug["scale_max"]))
             translate_fraction = float(aug["translate_fraction"])
 
-        image, balloon, boxes, kept = _letterbox_with_jitter(
-            image,
-            balloon,
-            boxes,
-            self.size,
-            scale_jitter,
-            translate_fraction,
+        image, boxes, kept, mask_by_index = _letterbox_with_jitter(
+            image, mask_by_index, boxes, self.size, scale_jitter, translate_fraction,
             self.training and self.stage1,
         )
         labels = [labels[i] for i in kept]
@@ -183,15 +161,20 @@ class MangaLayoutDataset(Dataset):
         x = torch.from_numpy(arr.copy()).permute(2, 0, 1)
         boxes_t = torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4)
         labels_t = torch.tensor(labels, dtype=torch.long)
-        mask = balloon.resize((self.size // 2, self.size // 2), Image.Resampling.NEAREST)
-        mask_t = torch.from_numpy((np.asarray(mask) > 127).astype(np.float32)).unsqueeze(0)
+        balloon_masks = []
+        for i, label in enumerate(labels):
+            if label == CLASS_TO_ID["balloon"]:
+                if i not in mask_by_index:
+                    raise RuntimeError(f"retained balloon target lost its instance mask: {row['image_id']} index={i}")
+                mask = mask_by_index[i].resize((self.mask_size, self.mask_size), Image.Resampling.NEAREST)
+                balloon_masks.append(torch.from_numpy((np.asarray(mask) > 127).astype(np.float32)))
+        masks_t = (torch.stack(balloon_masks) if balloon_masks else
+                   torch.empty((0, self.mask_size, self.mask_size), dtype=torch.float32))
         target = {
             "boxes": boxes_t,
             "labels": labels_t,
-            "balloon_mask": mask_t,
-            "image_id": row["image_id"],
-            "book_id": row["book_id"],
-            "split": row["split"],
+            "balloon_masks": masks_t,
+            "image_id": row["image_id"], "book_id": row["book_id"], "split": row["split"],
         }
         return x, target
 
@@ -200,20 +183,24 @@ def collate(batch):
     return torch.stack([x for x, _ in batch]), [t for _, t in batch]
 
 
-def weighted_sampler(dataset: MangaLayoutDataset, cfg: dict[str, Any], seed: int):
-    s = cfg["sampling"]
-    weights = []
-    for row in dataset.rows:
-        weight = 1.0
-        if row.get("has_onomatopoeia"):
-            weight *= float(s["onomatopoeia_page_weight"])
-        if row.get("has_balloon"):
-            weight *= float(s["balloon_page_weight"])
-        weights.append(weight)
+def repeat_factor_sampler(dataset: MangaLayoutDataset, cfg: dict[str, Any], seed: int):
+    """Detectron2/LVIS-style image repeat factors derived from actual frequency."""
+    rows = dataset.rows
+    frequency: dict[int, int] = {cid: 0 for cid in CLASS_TO_ID.values()}
+    for row in rows:
+        present = {CLASS_TO_ID[a["class_name"]] for a in row["annotations"]}
+        for cid in present:
+            frequency[cid] += 1
+    n = max(1, len(rows)); threshold = float(cfg["sampling"]["repeat_factor_threshold"])
+    max_repeat = float(cfg["sampling"]["max_repeat_factor"])
+    category_repeat = {
+        cid: min(max_repeat, max(1.0, math.sqrt(threshold / max(count / n, 1e-12))))
+        for cid, count in frequency.items()
+    }
+    factors = []
+    for row in rows:
+        present = {CLASS_TO_ID[a["class_name"]] for a in row["annotations"]}
+        factors.append(max([category_repeat[cid] for cid in present], default=1.0))
+    weights = torch.tensor(factors, dtype=torch.double)
     generator = torch.Generator().manual_seed(seed)
-    return WeightedRandomSampler(
-        torch.tensor(weights, dtype=torch.double),
-        len(weights),
-        replacement=True,
-        generator=generator,
-    )
+    return WeightedRandomSampler(weights, int(math.ceil(sum(factors))), replacement=True, generator=generator)

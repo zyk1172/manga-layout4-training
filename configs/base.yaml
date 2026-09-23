@@ -46,6 +46,7 @@ model:
   strides: [4, 8, 16, 32]
   size_ranges: [[0, 64], [64, 128], [128, 256], [256, 100000000]]
   mask_output_stride: 2
+  mask_prototypes: 8
   num_classes: 4
 
 assignment:
@@ -60,20 +61,24 @@ loss:
   positive_class_weights:
     frame: 1.0
     text: 1.0
-    balloon: 1.15
-    onomatopoeia: 1.35
+    balloon: 1.0
+    onomatopoeia: 1.0
 
 sampling:
-  # Only semantically valid page views; no arbitrary object crops in v1.
-  half_spread_probability: 0.45
+  # V1 keeps the full page by default. Half-spread is reserved for a later
+  # controlled ablation because cropping changes panel/balloon geometry.
+  half_spread_probability: 0.0
   half_spread_min_aspect: 1.35
-  onomatopoeia_page_weight: 1.75
-  balloon_page_weight: 1.10
+  # LVIS/Detectron2-style repeat-factor sampling. A category is repeated only
+  # when its actual image frequency is below this threshold.
+  repeat_factor_threshold: 0.05
+  max_repeat_factor: 2.0
 
 augmentation:
   stage1_fraction: 0.80
-  scale_min: 0.75
-  scale_max: 1.35
+  # <= 1.0 guarantees the full page remains visible; no implicit crop/zoom-in.
+  scale_min: 0.80
+  scale_max: 1.00
   translate_fraction: 0.06
   brightness: 0.08
   contrast: 0.10
@@ -105,12 +110,13 @@ training:
 
 selection:
   composite_weights:
-    frame_ap50: 0.22
-    text_ap50: 0.22
-    balloon_box_ap50: 0.20
-    onomatopoeia_ap50: 0.16
-    balloon_mask_iou: 0.10
-    balloon_boundary_f1: 0.10
+    # Equal, transparent weighting across the six actual product outputs.
+    frame_ap50: 1.0
+    text_ap50: 1.0
+    balloon_box_ap50: 1.0
+    onomatopoeia_ap50: 1.0
+    balloon_mask_ap50: 1.0
+    balloon_boundary_ap50: 1.0
 
 postprocess:
   score_threshold: 0.05
@@ -126,8 +132,11 @@ preflight:
   real_model_batches: [4, 2, 1]
   max_reserved_vram_fraction: 0.80
   overfit_pages: 16
-  overfit_steps: 300
+  overfit_steps: 500
   require_loss_drop_fraction: 0.20
+  require_overfit_box_ap50: 0.30
+  require_overfit_mask_ap50: 0.25
+  require_overfit_boundary_ap50: 0.20
   require_finite: true
 
 export:

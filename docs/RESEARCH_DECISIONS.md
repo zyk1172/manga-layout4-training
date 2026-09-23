@@ -20,11 +20,11 @@ These are references for methodology, not copied frameworks.
 3. Decoupled classification and box towers.
 4. Quality Focal-style targets: a positive class target is the detached IoU of the current predicted box and its assigned GT. This makes the score useful for ranking/NMS.
 5. GIoU box loss.
-6. BCE + Dice balloon foreground loss at stride 2.
+6. YOLACT-style shared mask prototypes + per-instance coefficients, supervised with per-instance BCE + Dice at stride 2.
 7. AdamW, linear warmup, cosine decay, EMA, gradient clipping, deterministic seed.
 8. Strong-to-weak schedule: mild scale/translation/photometric augmentation first, then plain letterbox late.
-9. Class/page reweighting for onomatopoeia rather than duplicate synthetic crops.
-10. Full-page and valid half-spread views only.
+9. LVIS/Detectron2-style repeat-factor sampling computed from actual image frequency; no simultaneous hand-tuned SFX loss multiplier.
+10. Full-page views only in the formal V1 baseline; half-spread remains an explicit later ablation.
 
 ## What V1 deliberately does not adopt
 
@@ -63,8 +63,8 @@ The assignment remains FCOS-style center sampling plus FPN size ranges. Tiny obj
 
 ## Balloon contour policy
 
-MangaSeg balloon instance masks are merged into a page-level balloon foreground target. The network predicts a 320x320 binary mask for a 640x640 input. At inference each detected balloon box gates the foreground mask; connected components/overlap yield a contour per detected balloon. This avoids dynamic per-instance mask kernels inside Core ML while retaining a real shape signal.
+MangaSeg balloon instance identity is preserved. The network predicts 8 shared 320×320 prototypes plus 8 coefficients at every detector location. The coefficient vector of each surviving balloon detection composes an instance mask, which is cropped to that detection box. This is a YOLACT-style fully convolutional decomposition and keeps instance separation outside dynamic ROI/control-flow operators in Core ML.
 
 ## Promotion rule
 
-Do not select a checkpoint by validation loss alone. Candidate selection is a weighted metric across frame/text/balloon/SFX AP50 plus balloon mask IoU and boundary F1. Final product claims require a fresh independent holdout, because the old Manga109-s test split has already been observed by the previous project.
+Do not select a checkpoint by validation loss alone. Candidate selection is an equal-weight mean across four box AP50 values plus balloon instance Mask AP50 and boundary AP50; AP75, recall, FP/page and duplicate FP remain diagnostics. Final product claims require a fresh independent holdout, because the old Manga109-s test split has already been observed by the previous project.

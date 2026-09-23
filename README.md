@@ -4,7 +4,7 @@ Independent training project for four manga-structure classes:
 
 `frame / text / balloon / onomatopoeia`
 
-`face` and `body` are intentionally not targets. Balloon additionally gets a high-resolution foreground mask so the app can recover real balloon contours.
+`face` and `body` are intentionally not targets. Balloon additionally gets a lightweight **instance** mask path (shared high-resolution prototypes + per-detection coefficients) so the app can recover a distinct contour for each balloon.
 
 ## Important separation from the old project
 
@@ -64,7 +64,7 @@ The current Ultralytics licensing model places proprietary/commercial use under 
 
 ## Why not blindly transplant the full RTMDet COCO recipe
 
-RTMDet is the principal reference for the optimization recipe, but generic COCO Mosaic/MixUp/horizontal-flip augmentation is not copied blindly. Manga panels and Japanese text have page-structure constraints. V1 keeps the well-supported optimization components (quality-aware classification, GIoU, EMA, warmup/cosine, two-stage augmentation) while retaining a small static, Core-ML-friendly model graph and a stride-4 P2 feature level.
+RTMDet is the principal reference for the optimization recipe, but generic COCO Mosaic/MixUp/horizontal-flip augmentation is not copied blindly. Manga panels and Japanese text have page-structure constraints. V1 keeps the well-supported optimization components (quality-aware classification, GIoU, EMA, warmup/cosine, full-page strong→weak augmentation, frequency-derived repeat-factor sampling) while retaining a small static, Core-ML-friendly model graph and a stride-4 P2 feature level. Balloon instance masks use a YOLACT-style prototype/coefficients decomposition rather than a page-level semantic mask.
 
 
 ## Design / operating notes

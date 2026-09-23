@@ -23,7 +23,7 @@ def main():
    if a.device.startswith('cuda'): torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
    model=build_model(cfg,pretrained_backbone=None).to(a.device).train()
    items=[ds[i%len(ds)] for i in range(bs)]; images,targets=collate(items); images=images.to(a.device)
-   for t in targets: t['boxes']=t['boxes'].to(a.device); t['labels']=t['labels'].to(a.device); t['balloon_mask']=t['balloon_mask'].to(a.device)
+   for t in targets: t['boxes']=t['boxes'].to(a.device); t['labels']=t['labels'].to(a.device); t['balloon_masks']=t['balloon_masks'].to(a.device)
    opt=torch.optim.AdamW(model.parameters(),lr=1e-4)
    # warm one step + timed two steps on actual graph
    timings=[]

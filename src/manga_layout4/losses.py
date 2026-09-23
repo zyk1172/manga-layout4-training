@@ -3,7 +3,7 @@ from typing import Any, Sequence
 import torch
 from torch import Tensor
 from torch.nn import functional as F
-from . import CLASSES
+from . import CLASSES, CLASS_TO_ID
 from .model import STRIDES
 
 
@@ -21,6 +21,7 @@ def assign_targets(image_size:int,target:dict[str,Any],size_ranges:Sequence[Sequ
     for stride,(lower,upper) in zip(STRIDES,size_ranges):
         h=(image_size+stride-1)//stride; w=h; pts=locations(h,w,stride,device,dtype); n=len(pts)
         assigned=torch.full((n,),-1,device=device,dtype=torch.long)
+        assigned_gt=torch.full((n,),-1,device=device,dtype=torch.long)
         gt_boxes=torch.zeros((n,4),device=device,dtype=dtype)
         if len(boxes):
             l=pts[:,0,None]-boxes[None,:,0]; t=pts[:,1,None]-boxes[None,:,1]
@@ -35,13 +36,11 @@ def assign_targets(image_size:int,target:dict[str,Any],size_ranges:Sequence[Sequ
             cr=cbox[None,:,2]-pts[:,0,None]; cb=cbox[None,:,3]-pts[:,1,None]
             center=torch.stack([cl,ct,cr,cb],-1).min(-1).values>=0
             cand=inside&inrange&center
-            # Tiny GT fallback: if a GT has no center candidate on this level,
-            # keep its in-range interior candidates.
             has=cand.any(0); cand=torch.where(has[None,:],cand,inside&inrange)
             costs=torch.where(cand,areas[None,:],torch.full_like(areas[None,:],float("inf")))
             minarea,idx=costs.min(1); pos=torch.isfinite(minarea)
-            assigned[pos]=labels[idx[pos]]; gt_boxes[pos]=boxes[idx[pos]]
-        out.append({"points":pts,"labels":assigned,"gt_boxes":gt_boxes})
+            assigned[pos]=labels[idx[pos]]; assigned_gt[pos]=idx[pos]; gt_boxes[pos]=boxes[idx[pos]]
+        out.append({"points":pts,"labels":assigned,"gt_indices":assigned_gt,"gt_boxes":gt_boxes})
     return out
 
 
@@ -76,10 +75,16 @@ def quality_focal(logits:Tensor,targets:Tensor,beta:float)->Tensor:
     return bce*(targets-p).abs().pow(beta)
 
 
-def dice_loss(logits:Tensor,target:Tensor)->Tensor:
-    p=logits.sigmoid(); dims=(1,2,3)
-    inter=(p*target).sum(dims); denom=p.sum(dims)+target.sum(dims)
-    return (1-(2*inter+1)/(denom+1)).mean()
+def _instance_mask_loss(logits: Tensor, target: Tensor, crop: Tensor) -> tuple[Tensor, Tensor]:
+    if not crop.any():
+        zero = logits.sum() * 0
+        return zero, zero
+    bce = F.binary_cross_entropy_with_logits(logits[crop], target[crop])
+    p = logits.sigmoid() * crop
+    t = target * crop
+    inter = (p * t).sum()
+    dice = 1 - (2 * inter + 1) / (p.sum() + t.sum() + 1)
+    return bce, dice
 
 
 def compute_loss(outputs:dict[str,Any],targets:list[dict[str,Any]],cfg:dict[str,Any])->dict[str,Tensor]:
@@ -87,13 +92,18 @@ def compute_loss(outputs:dict[str,Any],targets:list[dict[str,Any]],cfg:dict[str,
     beta=float(cfg["loss"]["quality_focal_beta"]); box_w=float(cfg["loss"]["box_giou_weight"])
     class_weights=outputs["cls_logits"][0].new_tensor([float(cfg["loss"]["positive_class_weights"][c]) for c in CLASSES])
     cls_total=outputs["cls_logits"][0].sum()*0; box_total=cls_total.clone(); pos_count=cls_total.clone()
+    mask_bce_total=cls_total.clone(); mask_dice_total=cls_total.clone(); mask_instances=0
+    balloon_id=CLASS_TO_ID["balloon"]
+
     for bi,target in enumerate(targets):
         boxes=target["boxes"].to(outputs["cls_logits"][0].device); labels=target["labels"].to(boxes.device)
-        t={"boxes":boxes,"labels":labels}
-        assigns=assign_targets(size,t,ranges,float(cfg["assignment"]["center_sampling_radius"]))
+        balloon_masks=target["balloon_masks"].to(boxes.device)
+        assigns=assign_targets(size,{"boxes":boxes,"labels":labels},ranges,float(cfg["assignment"]["center_sampling_radius"]))
+        best_coeff: dict[int, tuple[float, Tensor]] = {}
         for li,stride in enumerate(STRIDES):
             cls=outputs["cls_logits"][li][bi].permute(1,2,0).reshape(-1,len(CLASSES))
             reg=outputs["bbox_reg"][li][bi].permute(1,2,0).reshape(-1,4)
+            coeff=outputs["mask_coeff"][li][bi].permute(1,2,0).reshape(-1,outputs["mask_coeff"][li].shape[1])
             a=assigns[li]; pos=a["labels"]>=0
             qtargets=torch.zeros_like(cls)
             if pos.any():
@@ -101,22 +111,60 @@ def compute_loss(outputs:dict[str,Any],targets:list[dict[str,Any]],cfg:dict[str,
                 gt=a["gt_boxes"][pos]
                 quality=box_iou_aligned(pred.detach(),gt).clamp(0,1)
                 plabel=a["labels"][pos]
+                gt_indices=a["gt_indices"][pos]
                 qtargets[pos,plabel]=quality
                 bw=class_weights[plabel]
                 box_total=box_total+(giou_loss(pred,gt)*bw).sum()*box_w
                 pos_count=pos_count+bw.sum()
+                pos_indices=torch.nonzero(pos).squeeze(1)
+                for gt_index in torch.unique(gt_indices[plabel == balloon_id]).tolist():
+                    local=torch.nonzero((gt_indices == gt_index) & (plabel == balloon_id)).squeeze(1)
+                    if not len(local):
+                        continue
+                    q=quality[local]
+                    chosen_local=local[int(torch.argmax(q))]
+                    chosen_point=pos_indices[chosen_local]
+                    score=float(quality[chosen_local].detach().cpu())
+                    old=best_coeff.get(int(gt_index))
+                    if old is None or score > old[0]:
+                        best_coeff[int(gt_index)] = (score, coeff[chosen_point])
             qfl=quality_focal(cls,qtargets,beta)
             if pos.any():
-                # Modest positive class re-weighting; negatives remain unchanged.
                 plabel=a["labels"][pos]
                 qfl[pos,plabel]*=class_weights[plabel]
             cls_total=cls_total+qfl.sum()
+
+        balloon_gt_indices=torch.nonzero(labels == balloon_id).squeeze(1).tolist()
+        if len(balloon_gt_indices) != len(balloon_masks):
+            raise RuntimeError("balloon instance-mask count does not match balloon GT count")
+        mask_index_by_gt={gt_index:i for i,gt_index in enumerate(balloon_gt_indices)}
+        prototypes=outputs["mask_prototypes"][bi]
+        mh,mw=prototypes.shape[-2:]
+        for gt_index, mask_index in mask_index_by_gt.items():
+            selected=best_coeff.get(int(gt_index))
+            if selected is None:
+                continue
+            coeff=selected[1].tanh()
+            logits=(prototypes * coeff[:,None,None]).sum(0)
+            target_mask=balloon_masks[mask_index]
+            box=boxes[gt_index]
+            x1=max(0,min(mw,int(torch.floor(box[0] * mw / size).item())))
+            y1=max(0,min(mh,int(torch.floor(box[1] * mh / size).item())))
+            x2=max(0,min(mw,int(torch.ceil(box[2] * mw / size).item())))
+            y2=max(0,min(mh,int(torch.ceil(box[3] * mh / size).item())))
+            crop=torch.zeros((mh,mw),device=boxes.device,dtype=torch.bool)
+            if x2>x1 and y2>y1: crop[y1:y2,x1:x2]=True
+            bce,dice=_instance_mask_loss(logits,target_mask,crop)
+            mask_bce_total=mask_bce_total+bce; mask_dice_total=mask_dice_total+dice; mask_instances+=1
+
     norm=pos_count.clamp_min(1.0)
     cls_loss=cls_total/norm; box_loss=box_total/norm
-    mask_target=torch.stack([t["balloon_mask"] for t in targets]).to(outputs["balloon_mask_logits"].device)
-    mask_logits=outputs["balloon_mask_logits"]
-    bce=F.binary_cross_entropy_with_logits(mask_logits,mask_target)
-    dice=dice_loss(mask_logits,mask_target)
+    if mask_instances:
+        bce=mask_bce_total/mask_instances; dice=mask_dice_total/mask_instances
+    else:
+        bce=mask_bce_total; dice=mask_dice_total
     mask_loss=bce*float(cfg["loss"]["mask_bce_weight"])+dice*float(cfg["loss"]["mask_dice_weight"])
     total=cls_loss+box_loss+mask_loss
-    return {"total":total,"classification":cls_loss,"bbox":box_loss,"mask":mask_loss,"mask_bce":bce,"mask_dice":dice,"weighted_positive":pos_count.detach()}
+    return {"total":total,"classification":cls_loss,"bbox":box_loss,"mask":mask_loss,
+            "mask_bce":bce,"mask_dice":dice,"weighted_positive":pos_count.detach(),
+            "mask_instances":torch.tensor(float(mask_instances),device=total.device)}

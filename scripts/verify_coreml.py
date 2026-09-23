@@ -19,8 +19,11 @@ def main():
     traced = torch.jit.load(str(args.trace), map_location="cpu").eval()
     coreml = ct.models.MLModel(str(args.coreml), compute_units=ct.ComputeUnit.ALL)
     names = [
-        "p2_cls", "p2_bbox", "p3_cls", "p3_bbox", "p4_cls", "p4_bbox",
-        "p5_cls", "p5_bbox", "balloon_mask",
+        "p2_cls", "p2_bbox", "p2_mask_coeff",
+        "p3_cls", "p3_bbox", "p3_mask_coeff",
+        "p4_cls", "p4_bbox", "p4_mask_coeff",
+        "p5_cls", "p5_bbox", "p5_mask_coeff",
+        "mask_prototypes",
     ]
     diffs = []
     for seed in range(args.samples):

@@ -3,7 +3,7 @@
 ## Target
 
 Exactly four object classes: `frame`, `text`, `balloon`, `onomatopoeia`.
-The detector predicts boxes for all four. A dedicated high-resolution binary balloon-mask head predicts balloon foreground; per-balloon contours are recovered by intersecting the dense mask with detected balloon boxes.
+The detector predicts boxes for all four. A lightweight YOLACT-style balloon instance-mask path predicts shared high-resolution mask prototypes plus per-detection coefficients. Each detected balloon therefore receives its own mask/contour rather than sharing one page-level foreground map.
 
 ## Why this architecture
 
@@ -16,12 +16,12 @@ This is a clean new training lifecycle, not a V2B5/V3 continuation.
 The recipe takes the parts of modern real-time detector training that are portable and well supported on the target hardware:
 
 - ImageNet backbone initialization instead of random backbone initialization.
-- Quality-aware focal classification: positive class quality is the detached box IoU, so classification scores are aligned with localization quality.
+- Quality-aware focal classification: positive class quality is the detached box IoU, so classification scores are aligned with localization quality. The box head is initialized to stride-proportional object extents so this quality signal is non-trivial from the first updates.
 - GIoU box regression.
 - Decoupled classification/regression towers.
 - AdamW + linear warmup + cosine decay.
 - Exponential moving average of model weights.
-- Strong-to-weak training schedule: mild scale/translation/photometric augmentation in the first 80%, then weak augmentation in the last 20%.
+- Strong-to-weak training schedule: full-page scale-down/translation/photometric augmentation in the first 80%, then plain letterbox late. V1 does not crop/zoom into the page.
 - Gradient clipping and deterministic seeds.
 - Book-level train/validation separation.
 
@@ -35,16 +35,13 @@ If later evidence supports Mosaic/MixUp, add them as an explicit A/B experiment,
 
 ## SFX treatment
 
-MangaSeg reports onomatopoeia as a relatively scarce, thin and irregular category. V1 therefore:
-
-- keeps it separate from `text`;
-- weights pages containing SFX higher in the sampler;
-- gives SFX positives a modestly higher classification weight;
-- tracks SFX AP independently so overall metrics cannot hide regressions.
+MangaSeg reports onomatopoeia as a relatively scarce, thin and irregular category. V1 therefore keeps it separate from `text` and uses LVIS/Detectron2-style repeat-factor sampling derived from the **actual fraction of training pages** containing each category. Fixed SFX loss multipliers are not stacked on top of resampling. SFX AP is tracked independently so overall metrics cannot hide regressions.
 
 ## Balloon contour
 
-MangaSeg provides pixel-level instance masks. V1 trains a dense balloon foreground head at stride 2 (320×320 for a 640 input). At inference, each balloon detection box gates the balloon foreground mask; connected components and box overlap select the contour belonging to that detection. This avoids a dynamic instance-mask kernel in the Core ML graph while retaining a precise shape output.
+MangaSeg provides **instance** masks, so V1 preserves that supervision. A stride-2 prototype head produces 8 shared 320×320 mask bases and every detector location predicts 8 coefficients. For a balloon detection, the coefficients linearly combine the prototypes and the result is cropped by that instance box. This follows the mature YOLACT decomposition (shared prototypes + per-instance coefficients), keeps the neural graph fully convolutional/static for Core ML, and avoids the instance-merging failure of a page-level semantic mask.
+
+Validation uses balloon instance Mask AP50 and boundary-sensitive AP50 rather than page-level foreground IoU. Box AP75 and FP/page are also recorded diagnostically.
 
 ## Fail-fast gates
 

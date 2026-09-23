@@ -4,7 +4,7 @@ import argparse,json,math,sys,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]; sys.path.insert(0,str(ROOT/'src'))
 from manga_layout4.config import load_config
-from manga_layout4.data import MangaLayoutDataset,collate,weighted_sampler
+from manga_layout4.data import MangaLayoutDataset,collate,repeat_factor_sampler
 from manga_layout4.losses import compute_loss
 from manga_layout4.metrics import evaluate
 from manga_layout4.model import build_model
@@ -25,7 +25,7 @@ def _params(model,base_lr,backbone_mult,wd):
 
 def _move(targets,device):
  for t in targets:
-  for k in ('boxes','labels','balloon_mask'): t[k]=t[k].to(device,non_blocking=True)
+  for k in ('boxes','labels','balloon_masks'): t[k]=t[k].to(device,non_blocking=True)
  return targets
 
 def main():
@@ -45,7 +45,7 @@ def main():
  seed=int(cfg['project']['seed']); seed_everything(seed); device=torch.device(a.device)
  pf=json.loads(pf_path.read_text()); bs=a.micro_batch or int(pf['recommended_micro_batch']); accum=a.grad_accum or int(pf['recommended_gradient_accumulation'])
  train_ds=MangaLayoutDataset(a.manifest,cfg,'train',True); val_ds=MangaLayoutDataset(a.manifest,cfg,'val',False)
- sampler=weighted_sampler(train_ds,cfg,seed)
+ sampler=repeat_factor_sampler(train_ds,cfg,seed)
  nw=int(cfg['training']['num_workers'])
  train_loader=torch.utils.data.DataLoader(train_ds,batch_size=bs,sampler=sampler,num_workers=nw,pin_memory=bool(cfg['training']['pin_memory']),persistent_workers=bool(cfg['training']['persistent_workers']) and nw>0,collate_fn=collate,drop_last=True)
  val_loader=torch.utils.data.DataLoader(val_ds,batch_size=bs,shuffle=False,num_workers=max(0,min(2,nw)),pin_memory=bool(cfg['training']['pin_memory']),persistent_workers=False,collate_fn=collate)
@@ -66,6 +66,11 @@ def main():
    loss.backward(); micro+=1
    for k in sums: sums[k]+=float(losses[k].detach().cpu())
    if micro%accum==0 or micro==len(train_loader):
+    remainder=micro%accum
+    if micro==len(train_loader) and remainder:
+     scale=accum/remainder
+     for p in model.parameters():
+      if p.grad is not None: p.grad.mul_(scale)
     torch.nn.utils.clip_grad_norm_(model.parameters(),float(cfg['training']['gradient_clip_norm']))
     lr=lr_at(global_step,total_opt_steps,warm,base_lr,min_ratio)
     for g in opt.param_groups: g['lr']=lr*float(g.get('lr_mult',1.0))
