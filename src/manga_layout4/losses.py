@@ -99,7 +99,7 @@ def compute_loss(outputs:dict[str,Any],targets:list[dict[str,Any]],cfg:dict[str,
         boxes=target["boxes"].to(outputs["cls_logits"][0].device); labels=target["labels"].to(boxes.device)
         balloon_masks=target["balloon_masks"].to(boxes.device)
         assigns=assign_targets(size,{"boxes":boxes,"labels":labels},ranges,float(cfg["assignment"]["center_sampling_radius"]))
-        best_coeff: dict[int, tuple[float, Tensor]] = {}
+        coeff_candidates: dict[int, list[tuple[Tensor, Tensor]]] = {}
         for li,stride in enumerate(STRIDES):
             cls=outputs["cls_logits"][li][bi].permute(1,2,0).reshape(-1,len(CLASSES))
             reg=outputs["bbox_reg"][li][bi].permute(1,2,0).reshape(-1,4)
@@ -124,10 +124,9 @@ def compute_loss(outputs:dict[str,Any],targets:list[dict[str,Any]],cfg:dict[str,
                     q=quality[local]
                     chosen_local=local[int(torch.argmax(q))]
                     chosen_point=pos_indices[chosen_local]
-                    score=float(quality[chosen_local].detach().cpu())
-                    old=best_coeff.get(int(gt_index))
-                    if old is None or score > old[0]:
-                        best_coeff[int(gt_index)] = (score, coeff[chosen_point])
+                    coeff_candidates.setdefault(int(gt_index), []).append(
+                        (quality[chosen_local].detach(), coeff[chosen_point])
+                    )
             qfl=quality_focal(cls,qtargets,beta)
             if pos.any():
                 plabel=a["labels"][pos]
@@ -141,10 +140,12 @@ def compute_loss(outputs:dict[str,Any],targets:list[dict[str,Any]],cfg:dict[str,
         prototypes=outputs["mask_prototypes"][bi]
         mh,mw=prototypes.shape[-2:]
         for gt_index, mask_index in mask_index_by_gt.items():
-            selected=best_coeff.get(int(gt_index))
-            if selected is None:
+            candidates=coeff_candidates.get(int(gt_index))
+            if not candidates:
                 continue
-            coeff=selected[1].tanh()
+            qualities=torch.stack([item[0] for item in candidates])
+            coeffs=torch.stack([item[1] for item in candidates])
+            coeff=coeffs[torch.argmax(qualities)].tanh()
             logits=(prototypes * coeff[:,None,None]).sum(0)
             target_mask=balloon_masks[mask_index]
             box=boxes[gt_index]

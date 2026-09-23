@@ -29,7 +29,7 @@ The recipe is inspired by RTMDet/GFL, but the graph remains ordinary PyTorch/tor
 
 ## Deliberate deviations from generic COCO recipes
 
-Mosaic, MixUp, random arbitrary crops, and horizontal flips are **off by default**. Generic RTMDet uses Mosaic/MixUp and then switches them off late, but manga page structure is not a generic natural-image task: Mosaic fabricates impossible panel boundaries, arbitrary crops were already implicated in prior project distribution-shift experiments, and horizontal flips mirror Japanese text. The safe augmentation is full page + valid half-spread views + moderate scale/translation.
+Mosaic, MixUp, random arbitrary crops, and horizontal flips are **off by default**. Generic RTMDet uses Mosaic/MixUp and then switches them off late, but manga page structure is not a generic natural-image task: Mosaic fabricates impossible panel boundaries, arbitrary crops were already implicated in prior project distribution-shift experiments, and horizontal flips mirror Japanese text. The formal V1 augmentation keeps the complete page visible and uses only scale-down, bounded translation inside padding, and mild photometric changes. Half-spread remains a later controlled ablation.
 
 If later evidence supports Mosaic/MixUp, add them as an explicit A/B experiment, not as a silent default.
 
@@ -49,7 +49,7 @@ Formal training is not the first command. Required sequence:
 
 1. dataset build/audit;
 2. actual-model CUDA batch benchmark;
-3. 16-page 300-step overfit test;
+3. 16-page 500-step memorization/overfit test;
 4. TorchScript raw-output trace smoke;
 5. on Mac, Core ML conversion/equivalence smoke;
 6. formal training.
