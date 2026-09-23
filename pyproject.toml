@@ -1,0 +1,21 @@
+[project]
+name = "manga-layout4-training"
+version = "0.1.0"
+description = "Four-class manga layout detector with balloon contour segmentation"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy>=1.26,<3",
+  "Pillow>=10,<13",
+  "PyYAML>=6,<7",
+  "torch==2.7.0",
+  "torchvision==0.22.0",
+]
+
+[project.optional-dependencies]
+mac = ["coremltools==9.0"]
+dev = ["pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

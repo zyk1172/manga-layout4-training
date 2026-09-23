@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+outputs/*
+!outputs/.gitkeep
+data/generated/
+data/manifests/*.json
+data/manifests/*.jsonl
+*.mlpackage/
+*.mlmodelc/
+*.pt
+*.pth
+.DS_Store

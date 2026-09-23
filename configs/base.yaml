@@ -1,0 +1,139 @@
+schema_version: manga-layout4-v1
+project:
+  name: MangaLayout4V1
+  seed: 20260923
+
+source:
+  # Point this at the EXISTING old training repo; no dataset is copied into this repo.
+  windows_candidates:
+    - 'F:/codex/manga-model'
+  mac_candidates:
+    - '/Users/zhengyunkai/Documents/开发项目/正式项目/工具/manga-vision-training'
+  env_var: MANGA_VISION_SOURCE_ROOT
+  manga109s_images_rel: data/raw/manga109s/images
+  mangaseg_rel: data/external/MangaSegmentation
+  split_rel: data/splits
+
+classes:
+  names: [frame, text, balloon, onomatopoeia]
+  balloon_class: balloon
+  # Only these four categories are targets. face/body are intentionally absent.
+
+split_policy:
+  train_split: train
+  val_split: val
+  legacy_test_split: test
+  allow_legacy_test_during_training: false
+  exclude_dimension_mismatch_books: [PrayerHaNemurenai]
+  # Expected matched local coverage after excluding the 98 Prayer pages.
+  expected_pages: {train: 6411, val: 1019, test: 991}
+  # Old Manga109-s test is already observed. Keep it out of training/tuning by default.
+
+input:
+  image_size: 640
+  pad_value: 1.0
+  normalization:
+    enabled: true
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+model:
+  backbone: mobilenet_v3_small
+  backbone_init: imagenet1k_v1
+  fpn_channels: 96
+  detail_channels: 32
+  head_blocks: 2
+  strides: [4, 8, 16, 32]
+  size_ranges: [[0, 64], [64, 128], [128, 256], [256, 100000000]]
+  mask_output_stride: 2
+  num_classes: 4
+
+assignment:
+  center_sampling_radius: 1.5
+  tiny_gt_fallback: true
+
+loss:
+  quality_focal_beta: 2.0
+  box_giou_weight: 2.0
+  mask_bce_weight: 1.0
+  mask_dice_weight: 1.0
+  positive_class_weights:
+    frame: 1.0
+    text: 1.0
+    balloon: 1.15
+    onomatopoeia: 1.35
+
+sampling:
+  # Only semantically valid page views; no arbitrary object crops in v1.
+  half_spread_probability: 0.45
+  half_spread_min_aspect: 1.35
+  onomatopoeia_page_weight: 1.75
+  balloon_page_weight: 1.10
+
+augmentation:
+  stage1_fraction: 0.80
+  scale_min: 0.75
+  scale_max: 1.35
+  translate_fraction: 0.06
+  brightness: 0.08
+  contrast: 0.10
+  horizontal_flip: false
+  mosaic: false
+  mixup: false
+
+training:
+  epochs: 80
+  micro_batch_size: 4
+  gradient_accumulation: 2
+  effective_batch_size: 8
+  precision: fp32
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  optimizer: AdamW
+  learning_rate: 0.00020
+  backbone_lr_multiplier: 0.50
+  weight_decay: 0.01
+  warmup_optimizer_steps: 1000
+  min_lr_ratio: 0.05
+  gradient_clip_norm: 5.0
+  ema_decay: 0.9998
+  val_every_epochs: 4
+  checkpoint_every_epochs: 4
+  early_stop_min_epoch: 32
+  early_stop_patience_evals: 6
+
+selection:
+  composite_weights:
+    frame_ap50: 0.22
+    text_ap50: 0.22
+    balloon_box_ap50: 0.20
+    onomatopoeia_ap50: 0.16
+    balloon_mask_iou: 0.10
+    balloon_boundary_f1: 0.10
+
+postprocess:
+  score_threshold: 0.05
+  max_detections: 300
+  nms_iou:
+    frame: 0.50
+    text: 0.50
+    balloon: 0.45
+    onomatopoeia: 0.45
+  balloon_mask_threshold: 0.50
+
+preflight:
+  real_model_batches: [4, 2, 1]
+  max_reserved_vram_fraction: 0.80
+  overfit_pages: 16
+  overfit_steps: 300
+  require_loss_drop_fraction: 0.20
+  require_finite: true
+
+export:
+  require_pretrain_coreml_gate: true
+  pretrain_coreml_gate_report: outputs/export-smoke/coreml-equivalence.json
+  static_input: [1, 3, 640, 640]
+  raw_outputs_only: true
+  coreml_precision: fp32
+  minimum_deployment_target: iOS15
